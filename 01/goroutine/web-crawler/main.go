@@ -18,7 +18,7 @@ type result struct {
 	depth int
 }
 
-func Crawl(url string, depth int) {
+func crawl(url string, depth int) {
 	if depth < 0 {
 		return
 	}
@@ -33,13 +33,13 @@ func Crawl(url string, depth int) {
 	fetched[url] = true
 	for _, u := range urls {
 		if !fetched[u] {
-			Crawl(u, depth-1)
+			crawl(u, depth-1)
 		}
 	}
 	return
 }
 
-func ConcurrentCrawl(url string, depth int) {
+func concurrentCrawl(url string, depth int) {
 	ch := make(chan *result)
 
 	fetch := func(url string, depth int) {
@@ -73,7 +73,7 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	fetched = make(map[string]bool)
 	now := time.Now()
-	ConcurrentCrawl("http://andcloud.io", 2)
+	concurrentCrawl("http://andcloud.io", 2)
 	fmt.Println("time taken:", time.Since(now))
 }
 
