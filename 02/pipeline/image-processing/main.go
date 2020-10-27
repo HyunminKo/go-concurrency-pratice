@@ -7,10 +7,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/disintegration/imaging"
 )
+
+type result struct {
+	srcImagePath   string
+	thumbnailImage *image.NRGBA
+	err            error
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -19,7 +26,7 @@ func main() {
 
 	start := time.Now()
 
-	err := walkFiles(os.Args[1])
+	err := setupPipeLine(os.Args[1])
 
 	if err != nil {
 		log.Fatal(err)
@@ -28,37 +35,57 @@ func main() {
 	fmt.Printf("Time taken: %s\n", time.Since(start))
 }
 
-func walkFiles(root string) error {
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+func setupPipeLine(root string) error {
+	done := make(chan struct{})
+	defer close(done)
 
-		if !info.Mode().IsRegular() {
-			return nil
-		}
+	paths, errc := walkFiles(done, root)
 
-		contentType, _ := getFileContentType(path)
-		if contentType != "image/jpeg" {
-			return nil
-		}
+	results := processImage(done, paths)
 
-		thumbnailImage, err := processImage(path)
-		if err != nil {
-			return err
+	for r := range results {
+		if r.err != nil {
+			return r.err
 		}
+		saveThumbnail(r.srcImagePath, r.thumbnailImage)
+	}
 
-		err = saveThumbnail(path, thumbnailImage)
-		if err != nil {
-			return err
-		}
-		return nil
-	})
-
-	if err != nil {
+	if err := <-errc; err != nil {
 		return err
 	}
+
 	return nil
+}
+
+func walkFiles(done <-chan struct{}, root string) (<-chan string, <-chan error) {
+
+	paths := make(chan string)
+	errc := make(chan error, 1)
+
+	go func() {
+		defer close(paths)
+		errc <- filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if !info.Mode().IsRegular() {
+				return nil
+			}
+
+			contentType, _ := getFileContentType(path)
+			if contentType != "image/jpeg" {
+				return nil
+			}
+			select {
+			case paths <- path:
+			case <-done:
+				return fmt.Errorf("walk was canceld")
+			}
+			return nil
+		})
+	}()
+	return paths, errc
 }
 
 func getFileContentType(file string) (string, error) {
@@ -79,14 +106,44 @@ func getFileContentType(file string) (string, error) {
 	return contentType, nil
 }
 
-func processImage(path string) (*image.NRGBA, error) {
-	srcImage, err := imaging.Open(path)
-	if err != nil {
-		return nil, err
+func processImage(done <-chan struct{}, paths <-chan string) <-chan *result {
+	results := make(chan *result)
+
+	thumbnailer := func() {
+		for path := range paths {
+			srcImage, err := imaging.Open(path)
+			if err != nil {
+				select {
+				case results <- &result{path, nil, err}:
+				case <-done:
+					return
+				}
+			}
+			thumbnailImage := imaging.Thumbnail(srcImage, 100, 100, imaging.Lanczos)
+
+			select {
+			case results <- &result{path, thumbnailImage, nil}:
+			case <-done:
+				return
+			}
+		}
 	}
 
-	thumbnailImage := imaging.Thumbnail(srcImage, 100, 100, imaging.Lanczos)
-	return thumbnailImage, nil
+	const numThumbnailer = 5
+	wg := sync.WaitGroup{}
+	wg.Add(numThumbnailer)
+	for i := 0; i < numThumbnailer; i++ {
+		go func() {
+			thumbnailer()
+			wg.Done()
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	return results
 }
 
 func saveThumbnail(srcImagePath string, thumbnailImage *image.NRGBA) error {
